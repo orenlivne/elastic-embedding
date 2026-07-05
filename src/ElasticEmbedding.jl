@@ -800,16 +800,23 @@ FMG for EE: run the expensive μ-continuation cascade on a COARSE aggregation gr
 coarse embedding, rescale its amplitude to the fine scale (√(N/Nc)), and refine at μ_target on the fine grid
 with `ee_corrector!` — using fine deflation eigenvectors INTERPOLATED from the coarse ones (Pφ_coarse, no
 fine eigensolve). The fine grid does only refinement (a bounded number of sweeps), not the whole cascade.
-Validated to procrustes_rmsd ~3e-8 vs the Newton ground truth (swiss d=1). NOTE first cut: 2-level, dense
-coarse `eigen`/`pinv` (O(Nc³)) and a crude √(N/Nc) amplitude transfer; full O(N) needs recursive multilevel
-coarsening, a recursive inner-cycle coarse solve, and mass-weighted coarse repulsion.
+The coarse cascade runs at μ_target·(N/Nc) to match developedness (see below). Validated to procrustes_rmsd
+~1e-9 vs the Newton ground truth (swiss d=1), prolongation rmsd ~1.6%. NOTE first cut: 2-level, dense coarse
+`eigen`/`pinv` (O(Nc³)); full O(N) needs recursive multilevel coarsening, a recursive inner-cycle coarse
+solve, sparse-Lanczos φ, mass-weighted coarse repulsion (to sharpen the prolongation further), and fast
+summation for the O(N²) dense repulsion. The structure (cascade on the small grid, bounded fine refinement)
+is the O(N) skeleton.
 """
 function ee_fmg_solve(Lp::AbstractMatrix, μ_target::Float64, d::Int;
                       K::Int = 6, n_refine::Int = 20, tol::Float64 = 1e-7, σ2::Float64 = 1.0)
     N = size(Lp, 1)
     P1 = ee_aggregate_P(Lp); LpH = galerkin_coarse_operator(Lp, P1); Nc = size(LpH, 1)
-    Xc, _ = ee_continuation_solve(LpH, μ_target, d; K = K, σ2 = σ2)          # cascade on the coarse grid
-    X = Matrix(Xc * P1') .* sqrt(N / Nc)                                     # prolong + amplitude rescale
+    # DEVELOPEDNESS MATCH: the bifurcation thresholds scale as μ*_k = ν_{k+1}/N, so the SAME physical μ gives
+    # c_coarse = μ·Nc/ν₂ ≠ c_fine = μ·N/ν₂. Run the coarse cascade to μ_target·(N/Nc) (ν₂ preserved by
+    # Galerkin) so the coarse embedding has the SAME developedness — else it lands below its own threshold
+    # (trivial) and the prolongation is useless (rmsd~1). With the match, prolong rmsd ~1.6%.
+    Xc, _ = ee_continuation_solve(LpH, μ_target * N / Nc, d; K = K, σ2 = σ2)  # cascade on the coarse grid
+    X = Matrix(Xc * P1') .* sqrt(N / Nc)                                      # prolong + amplitude rescale
     for a in 1:d; X[a, argmax(abs.(view(X, a, :)))] < 0 && (X[a, :] .*= -1); end   # sign gauge
     Φf = Matrix(qr(P1 * eigen(Symmetric(Matrix(LpH))).vectors[:, 2:K+1]).Q)  # fine φ's interpolated from coarse
     # NOTE mass-inconsistency: coarse μ*_k = ν/Nc ≠ fine ν/N ⇒ prolonged embedding is under-developed and near
