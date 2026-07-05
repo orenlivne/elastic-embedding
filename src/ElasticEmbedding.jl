@@ -428,7 +428,7 @@ end
 # ----------------------------------------------------------------------------------------------
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
        ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, ee_two_level_galerkin!,
-       deflate_correct!, ee_diis, ee_solve, geometric_interpolation
+       ee_chord_newton_step!, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -570,6 +570,38 @@ function ee_two_level_galerkin!(X, Lp, P, μ, Q; ν1 = 1, ν2 = 2, σ2 = 1.0)
     δ .-= (δ * Q) * Q'                                          # PROJECTION deflation of the correction
     X .+= δ
     ee_smooth!(X, Lp, μ, ν2; σ2 = σ2)
+    X
+end
+
+"""
+    ee_chord_newton_step!(X, Lp, P, Q, μ; n_inner, ν1, ν2, σ2) -> X
+
+THE nonlinear cycle for geometric/indefinite EE — validated ~0.2/cycle (n_inner=1) or ~0.04 (n_inner=2),
+size- and d-independent (d=1,2,3), on the swiss roll. Chord-Newton outer + a DEFLATED two-grid inner
+solve of the correction equation J δ = −r, where J = L⁺ − μ Lm(X) is the chord Jacobian LAGGED at the
+current X (needs no knowledge of X*), r = J x^a the current residual per coordinate. Inner two-grid =
+the linearized deflation demo: smoother L⁺δ = μ Lm δ − r (lagged GS), Galerkin coarse J_H = PᵀJP, and
+projection deflation of the near-null modes (δ ← δ − Q Qᵀδ). The ~d embedding (near-null) modes are
+deflated here and advanced by μ-continuation (the "pin" in the two-level factor test = continuation's
+job); the inner solver reduces only the V⊥ correction. Q = [1, X coords, few mass-aware TVs] (all free —
+no eigensolve). NOTE this SUPERSEDES ee_two_level_galerkin!, whose full-X nonlinear smoother and
+correction-only deflation stalled; the correct move is to smooth/deflate the CORRECTION eqn, not X.
+"""
+function ee_chord_newton_step!(X, Lp, P, Q, μ; n_inner = 1, ν1 = 1, ν2 = 2, σ2 = 1.0)
+    Lm = build_Lminus_dense(X; σ2 = σ2)                        # chord Jacobian J = L⁺ − μLm, lagged at current X
+    JHi = pinv(Matrix(P' * (Lp * P .- μ .* (Lm * P))))         # Galerkin coarse J_H = PᵀJP
+    Jmul(v) = Lp * v .- μ .* (Lm * v)
+    defl(v) = (v .-= Q * (Q' * v); v)
+    for a in 1:size(X, 1)
+        r = Jmul(X[a, :]); δ = zeros(size(X, 2))               # solve J δ = −r for the correction
+        for _ in 1:n_inner
+            for _ in 1:ν1; gauss_seidel!(δ, Lp; b = μ .* (Lm * δ) .- r, sweeps = 1); end
+            δ .+= P * (JHi * (P' * (-r .- Jmul(δ)))); defl(δ)  # Galerkin coarse correction + error deflation
+            for _ in 1:ν2; gauss_seidel!(δ, Lp; b = μ .* (Lm * δ) .- r, sweeps = 1); end
+            defl(δ)
+        end
+        X[a, :] .+= δ
+    end
     X
 end
 

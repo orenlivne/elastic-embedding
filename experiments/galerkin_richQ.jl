@@ -24,18 +24,19 @@ ag = aggregate(Lp; X_ext = TV, rng = MersenneTwister(5)); agg = ag.aggregate
 P, _, _ = piecewise_constant_interpolation(agg)
 J = Matrix(Lp) .- μ .* Lm; Ve = eigen(Symmetric(J)).vectors
 
-# V⊥-pinned two-grid factor for the nonlinear Galerkin cycle with deflation basis Qraw
-function factor(Qraw; K = size(Qraw, 2), sweeps = 25, seeds = 1:3)
-    Q = Matrix(qr(Qraw).Q)[:, 1:K]
-    fs = Float64[]
+# V⊥-pinned two-grid factor for the nonlinear Galerkin cycle. metric=:resid uses ‖A(X)‖ (full Hessian
+# H=2J+mass-deriv), metric=:err uses ‖X−X*‖ (the actual error the demo measures).
+function factor(Qraw; K = size(Qraw, 2), sweeps = 25, seeds = 1:3, metric = :resid)
+    Q = Matrix(qr(Qraw).Q)[:, 1:K]; fs = Float64[]
+    meas(X) = metric === :err ? norm(X .- Xstar) : norm(ee_A(X, Lp, μ, ones(N)))
     for sd in seeds
         pert = 0.05 .* randn(MersenneTwister(sd), d, N); pert .-= (pert * Q) * Q'
         X = Xstar .+ pert; rr = Float64[]
         for _ in 1:sweeps
-            r0 = norm(ee_A(X, Lp, μ, ones(N))); ee_two_level_galerkin!(X, Lp, P, μ, Q)
-            X .-= ((X .- Xstar) * Q) * Q'                       # pin embedding modes (continuation's job)
-            rn = norm(ee_A(X, Lp, μ, ones(N))); (!isfinite(rn) || rn > 1e10) && break
-            push!(rr, rn / max(r0, 1e-300)); rn < 1e-12 && break
+            r0 = meas(X); ee_two_level_galerkin!(X, Lp, P, μ, Q)
+            X .-= ((X .- Xstar) * Q) * Q'                       # pin embedding modes
+            rn = meas(X); (!isfinite(rn) || rn > 1e10) && break
+            push!(rr, rn / max(r0, 1e-300)); rn < 1e-13 && break
         end
         fin = filter(x -> isfinite(x) && x > 0, rr); push!(fs, isempty(fin) ? Inf : exp(mean(log.(fin[max(1, end-4):end]))))
     end
