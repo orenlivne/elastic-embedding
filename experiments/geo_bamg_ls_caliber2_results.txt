@@ -1,0 +1,5 @@
+BEST_V1_caliber2=0.7690
+BEST_V2_caliberc=0.2696
+best2c=5
+best2stat=4.559e+00
+OVERALL_BEST=0.2696
