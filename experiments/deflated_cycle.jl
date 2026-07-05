@@ -29,12 +29,17 @@ function setup(d)
     (Xstar = Xstar, P = P, R = R, LpH = LpH, mass = mass, Q = Q)
 end
 
-function factor(cycle!, s, d; recomb, seeds = 1:3)
+function factor(cycle!, s, d; recomb, seeds = 1:3, pin = false)
     fs = Float64[]
+    Q = s.Q
     for sd in seeds
-        X = s.Xstar .+ 0.05 .* randn(MersenneTwister(sd), d, N); Xs = Matrix{Float64}[]; Rs = Matrix{Float64}[]; rr = Float64[]
+        pert = 0.05 .* randn(MersenneTwister(sd), d, N)
+        pin && (pert .-= (pert * Q) * Q')                       # V⊥ perturbation (Q = embedding modes)
+        X = s.Xstar .+ pert; Xs = Matrix{Float64}[]; Rs = Matrix{Float64}[]; rr = Float64[]
         for _ in 1:25
-            r0 = norm(ee_A(X, Lp, μ, ones(N))); cycle!(X); Rr = ee_A(X, Lp, μ, ones(N))
+            r0 = norm(ee_A(X, Lp, μ, ones(N))); cycle!(X)
+            pin && (X .-= ((X .- s.Xstar) * Q) * Q')            # keep embedding (Q) modes pinned to X* (continuation's job)
+            Rr = ee_A(X, Lp, μ, ones(N))
             if recomb
                 push!(Xs, copy(X)); push!(Rs, copy(Rr)); length(Xs) > 5 && (popfirst!(Xs); popfirst!(Rs))
                 length(Xs) ≥ 2 && (Xa = ee_diis(Xs, Rs); Ra = ee_A(Xa, Lp, μ, ones(N)); norm(Ra) < norm(Rr) && (X = Xa; Rr = Ra; Xs[end] = copy(X); Rs[end] = copy(Rr)))
@@ -54,6 +59,9 @@ for d in (1, 2)
     s = setup(d)
     nd(X) = ee_two_level_P!(X, Lp, s.LpH, s.P, s.R, s.mass, μ)
     df(X) = ee_two_level_deflated!(X, Lp, s.LpH, s.P, s.R, s.mass, μ, s.Q)
-    @printf("%d   non-deflated  %.3f   %.3f    %.1f\n", d, factor(nd, s, d; recomb = false), factor(nd, s, d; recomb = true), stat(nd, s, d))
-    @printf("%d   DEFLATED      %.3f   %.3f    %.2f\n", d, factor(df, s, d; recomb = false), factor(df, s, d; recomb = true), stat(df, s, d))
+    gk(X) = ee_two_level_galerkin!(X, Lp, s.P, μ, s.Q)                 # fixed cycle: Galerkin + projection deflation
+    @printf("%d   non-deflated       %.3f   %.3f    %.1f\n", d, factor(nd, s, d; recomb = false), factor(nd, s, d; recomb = true), stat(nd, s, d))
+    @printf("%d   additive-deflated  %.3f   %.3f    %.2f\n", d, factor(df, s, d; recomb = false), factor(df, s, d; recomb = true), stat(df, s, d))
+    @printf("%d   GALERKIN+proj-defl %.3f   %.3f    %.2f\n", d, factor(gk, s, d; recomb = false), factor(gk, s, d; recomb = true), stat(gk, s, d))
+    @printf("%d   GALERKIN (V⊥,pin)  %.3f   %.3f    (embedding modes pinned = continuation's job)\n", d, factor(gk, s, d; recomb = false, pin = true), factor(gk, s, d; recomb = true, pin = true))
 end

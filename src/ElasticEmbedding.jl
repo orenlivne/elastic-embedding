@@ -427,8 +427,8 @@ end
 # Two-level FAS cycle for genuine Elastic Embedding  (Phase-2 core; direct O(N²) Gaussian for now)
 # ----------------------------------------------------------------------------------------------
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
-       ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, deflate_correct!,
-       ee_diis, ee_solve, geometric_interpolation
+       ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, ee_two_level_galerkin!,
+       deflate_correct!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -546,6 +546,30 @@ function deflate_correct!(X, Lp, μ, Q; σ2 = 1.0)
     QJQi = pinv(Matrix(Q' * (Lp * Q .- μ .* (Lm * Q))))          # (QᵀJQ)⁺  (k×k)
     JXt = Lp * X' .- μ .* (Lm * X')                              # N×d : J x^a per column
     X .-= permutedims(Q * (QJQi * (Q' * JXt)))                   # additive Q-space correction
+    X
+end
+
+"""
+    ee_two_level_galerkin!(X, Lp, P, μ, Q; ν1, ν2, σ2) -> X
+
+Fixed FAS cycle for the geometric/indefinite case, matching the linearized demo that converges at ~0.2.
+Two departures from `ee_two_level_deflated!`: (1) the coarse correction is a LINEAR Galerkin solve of the
+frozen Jacobian J = L⁺ − μL⁻(X) — coarse operator J_H = PᵀJP, correction δ_H = −J_H⁺ Pᵀ r — instead of a
+rediscretized mass-Gaussian nonlinear coarse solve; (2) PROJECTION deflation (δ ← δ − (δQ)Qᵀ), which is
+stable for near-null Q, instead of the degenerate additive form. Smoother remains the nonlinear
+frozen-Gaussian GS. r = A(X)/2 is the current nonlinear residual (so the correction is a Newton-like
+step with a linearized coarse operator). O(N²·nc) from the dense J·P (fast summation → O(N·nc)).
+"""
+function ee_two_level_galerkin!(X, Lp, P, μ, Q; ν1 = 1, ν2 = 2, σ2 = 1.0)
+    ee_smooth!(X, Lp, μ, ν1; σ2 = σ2)
+    Lm = build_Lminus_dense(X; σ2 = σ2)
+    JH = Matrix(P' * (Lp * P .- μ .* (Lm * P)))                  # nc×nc Galerkin coarse Jacobian
+    r = ee_A(X, Lp, μ, ones(size(X, 2)); σ2 = σ2) ./ 2           # d×N nonlinear residual /2 (= J x^a per row)
+    δH = -(pinv(JH) * Matrix(r * P)')                           # nc×d coarse correction: J_H δ_H = −Pᵀ r
+    δ = permutedims(P * δH)                                     # d×N interpolate
+    δ .-= (δ * Q) * Q'                                          # PROJECTION deflation of the correction
+    X .+= δ
+    ee_smooth!(X, Lp, μ, ν2; σ2 = σ2)
     X
 end
 
