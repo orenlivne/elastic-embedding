@@ -427,7 +427,7 @@ end
 # Two-level FAS cycle for genuine Elastic Embedding  (Phase-2 core; direct O(N²) Gaussian for now)
 # ----------------------------------------------------------------------------------------------
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
-       ee_two_level!, ee_two_level_P!, ee_diis, ee_solve
+       ee_two_level!, ee_two_level_P!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -493,6 +493,40 @@ function ee_two_level_P!(X, Lp, LpH, P, R, mass, μ; ν1 = 1, ν2 = 2, σ2 = 1.0
     X .+= Matrix((Y .- Y0) * P')
     ee_smooth!(X, Lp, μ, ν2; σ2 = σ2)
     X
+end
+
+"""
+    geometric_interpolation(agg, X; c=0, ridge=1e-6) -> P, R
+
+GEOMETRIC (embedding-aware) interpolation, for geometric/manifold graphs where the low modes vary
+SMOOTHLY across aggregates and piecewise-constant caliber-1 staircases them. Coarse points are the
+aggregate SEEDS at their embedding positions Y_I = X[:,seed_I]. Each non-seed fine node i interpolates
+from its `c` nearest seeds (default 2(d+1)) with AFFINE least-squares weights — min‖Σ p_J Y_J − x_i‖²
+s.t. Σ p_J = 1 — so LINEAR functions of the embedding are reproduced exactly (order-1 interpolation).
+Seeds stay caliber-1 (P[seed_I,I]=1) and R = seed injection ⇒ R·P=I exactly (FAS-safe). Extrapolation
+guard (|p|>3) falls back to caliber-1. Uses the current embedding X as the frozen geometry.
+"""
+function geometric_interpolation(agg::AbstractVector{Int}, X::AbstractMatrix; c::Int = 0, ridge::Float64 = 1e-6)
+    d, n = size(X); nc = maximum(agg)
+    seed = zeros(Int, nc); @inbounds for i in 1:n; a = agg[i]; seed[a] == 0 && (seed[a] = i); end
+    isseed = falses(n); for a in 1:nc; isseed[seed[a]] = true; end
+    Y = X[:, seed]                                   # d × nc seed positions
+    cc = c > 0 ? c : 2 * (d + 1)
+    Ip = Int[]; Jp = Int[]; Vp = Float64[]; dist = zeros(nc)
+    @inbounds for i in 1:n
+        if isseed[i]; push!(Ip, i); push!(Jp, agg[i]); push!(Vp, 1.0); continue; end
+        xi = @view X[:, i]
+        for J in 1:nc; s = 0.0; for k in 1:d; δ = xi[k] - Y[k, J]; s += δ * δ; end; dist[J] = s; end
+        nn = partialsortperm(dist, 1:min(cc, nc)); m = length(nn); Yn = Y[:, nn]
+        G = Yn' * Yn; G .+= (ridge * (tr(G) / m + 1e-300)) .* Matrix(I, m, m)
+        p = try ([2G ones(m); ones(m)' 0.0] \ [2 .* (Yn' * xi); 1.0])[1:m] catch; fill(1.0 / m, m) end
+        if any(!isfinite, p) || maximum(abs, p) > 3.0
+            push!(Ip, i); push!(Jp, agg[i]); push!(Vp, 1.0)
+        else
+            for (idx, J) in enumerate(nn); abs(p[idx]) > 1e-8 && (push!(Ip, i); push!(Jp, J); push!(Vp, p[idx])); end
+        end
+    end
+    sparse(Ip, Jp, Vp, n, nc), sparse(collect(1:nc), seed, ones(nc), nc, n)
 end
 
 """Energy-minimizing iterate recombination (DIIS): X ← Σ c_k X_k, min‖Σ c_k A(X_k)‖ s.t. Σc_k=1.
