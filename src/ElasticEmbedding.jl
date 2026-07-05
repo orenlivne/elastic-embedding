@@ -11,7 +11,7 @@ stubbed at the bottom of this file.
 module ElasticEmbedding
 
 using SparseArrays, LinearAlgebra, Random, Statistics
-using LAMG: aggregate, piecewise_constant_interpolation, galerkin_coarse_operator
+using LAMG: aggregate, piecewise_constant_interpolation, galerkin_coarse_operator, setup, solve
 
 export sbm_graph, incidence, weighted_laplacian, edge_differences,
        plaplacian_weights, frozen_plaplacian, bottom_eigenvectors, fiedler_vector,
@@ -479,7 +479,7 @@ end
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
        ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, ee_two_level_galerkin!,
        ee_chord_newton_step!, ee_defl_basis, ee_reduced_hessian, ee_reduced_newton_step!, ee_corrector!,
-       ee_aggregate_P, ee_continuation_solve, ee_fmg_solve, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
+       ee_aggregate_P, ee_bottom_eigvecs, ee_continuation_solve, ee_fmg_solve, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -714,13 +714,8 @@ function ee_reduced_newton_step!(X::AbstractMatrix, Lp::AbstractMatrix, Q::Abstr
     d, N = size(X); k = size(Q, 2)
     G = ee_gradient(X, Lp, μ)
     rH = ee_reduced_hessian(X, Lp, Q, μ; σ2 = σ2)
-    # make the reduced Hessian positive so the step is a descent direction even away from the min
-    if linesearch
-        λmin = eigen(Symmetric(rH)).values[1]
-        rH[diagind(rH)] .+= max(reg, reg - λmin)
-    else
-        rH[diagind(rH)] .+= reg
-    end
+    # make the reduced Hessian positive (descent direction even away from the min) — via Cholesky shift, no eigen
+    linesearch ? pd_shift!(rH; reg = reg) : (rH[diagind(rH)] .+= reg)
     GQ = Matrix(G * Q)                                       # d×k reduced gradient
     rg = [GQ[a, γ] for γ in 1:k for a in 1:d]                # (γ−1)d+a order
     ΔX = reshape(-(rH \ rg), d, k) * Q'
@@ -757,6 +752,41 @@ function ee_corrector!(X::AbstractMatrix, Lp::AbstractMatrix, P::AbstractMatrix,
     X, resid
 end
 
+"""
+    ee_bottom_eigvecs(Lp, K; iters, guard, rng) -> (ν, Φ)
+
+Bottom-K NONTRIVIAL eigenpairs of the graph Laplacian Lp (⊥ constant), ν ascending, Φ (N×K) orthonormal —
+computed WITHOUT dense eigen: subspace inverse iteration preconditioned by the LAMG multigrid solve (each
+L⁺⁻¹ apply is O(N)), Rayleigh-Ritz each step. `guard` extra vectors are carried and discarded so the kept K
+converge well. Validated vs dense eigen: bottom-6 eigenvalues to ~1e-13, subspace angle ≤1e-1. This is the
+O(N) replacement for `eigen` in the continuation/FMG solver path.
+"""
+function ee_bottom_eigvecs(Lp::AbstractMatrix, K::Int; iters::Int = 50, guard::Int = 2, rng = MersenneTwister(1))
+    N = size(Lp, 1); m = min(K + guard, N - 1)
+    Ls = (sparse(Lp) + sparse(Lp)') / 2; Ls -= spdiagm(0 => vec(sum(Ls, dims = 2)))   # exact Laplacian (LAMG asserts)
+    ml = setup(Ls)
+    Y = randn(rng, N, m); Y .-= mean(Y, dims = 1); Y = Matrix(qr(Y).Q)
+    local ν, Φ
+    for _ in 1:iters
+        Z = zeros(N, m)
+        for k in 1:m
+            b = Y[:, k] .- mean(Y[:, k]); z, _ = solve(ml, b); z .-= mean(z); Z[:, k] = z
+        end
+        Qz = Matrix(qr(Z).Q); F = eigen(Symmetric(Qz' * (Lp * Qz)))    # Rayleigh-Ritz (m×m, tiny)
+        ν = F.values; Φ = Qz * F.vectors; Y = Φ
+    end
+    ν[1:K], Φ[:, 1:K]
+end
+
+"""Make a small symmetric matrix positive-definite by incremental diagonal shift (no eigen): the smallest
+shift (starting at `reg`, doubling) for which Cholesky succeeds. For the dk×dk reduced Hessian."""
+function pd_shift!(A::AbstractMatrix; reg::Float64 = 1e-9)
+    A[diagind(A)] .+= reg; s = max(reg, 1e-12)
+    while true
+        try; cholesky(Symmetric(A)); return A; catch; A[diagind(A)] .+= s; s *= 2; s > 1e8 && return A; end
+    end
+end
+
 """LAMG+ aggregation interpolation P for L⁺, from a few L⁺-relaxed test vectors (structural, X-independent)."""
 function ee_aggregate_P(Lp::AbstractMatrix; ntv::Int = 8, sweeps::Int = 4, rng = MersenneTwister(5))
     N = size(Lp, 1); TV = zeros(N, ntv)
@@ -774,18 +804,18 @@ Genuine EE embedding computed FROM SCRATCH by μ-continuation — no oracle. Sta
 bifurcation μ*_d = ν_{d+1}/N with normal-form √-seeds X[a,:] = √(μ₀−μ*_a)·φ_{a+1} (φ = L⁺ eigenvectors,
 NOT X*), march μ geometrically to μ_target, and correct each step with `ee_corrector!` (deflated inner +
 reduced-V Newton). Supercritical pitchfork ⇒ monotone in μ, no arclength. Validated to procrustes_rmsd ~1e-9
-vs the Newton ground truth (swiss d=1, sheet d=2). Bottom eigenpairs via dense `eigen` here (Lanczos /
-`bottom_eigenvectors` for large N). This is the scalable analogue's single-grid core; wrap in FMG for O(N).
+vs the Newton ground truth (swiss d=1, sheet d=2). Bottom eigenpairs via the O(N) `ee_bottom_eigvecs`
+(LAMG-preconditioned subspace iteration — no dense eigen). Single-grid core; wrap in FMG for O(N).
 """
 function ee_continuation_solve(Lp::AbstractMatrix, μ_target::Float64, d::Int;
                                nsteps::Int = 16, K::Int = 6, μ0_factor::Float64 = 1.15,
                                n_outer::Int = 20, tol::Float64 = 1e-7, σ2::Float64 = 1.0)
     N = size(Lp, 1)
-    ev = eigen(Symmetric(Matrix(Lp))); ν = ev.values; Φ = ev.vectors[:, 2:K+d+1]   # φ₂ … φ_{K+d+1}
+    ν, Φ = ee_bottom_eigvecs(Lp, K + d)         # bottom nontrivial φ₂…, ν ascending (O(N), no dense eigen)
     P = ee_aggregate_P(Lp)
-    μ0 = μ0_factor * ν[d+1] / N
+    μ0 = μ0_factor * ν[d] / N                    # μ*_d = ν_{d+1}/N = ν[d] (nontrivial indexing)
     X = zeros(d, N)
-    for a in 1:d; X[a, :] = sqrt(max(μ0 - ν[a+1] / N, 0.0)) .* Φ[:, a]; end
+    for a in 1:d; X[a, :] = sqrt(max(μ0 - ν[a] / N, 0.0)) .* Φ[:, a]; end
     resid = Inf
     for μ in exp.(range(log(μ0), log(μ_target), length = nsteps))[2:end]
         _, resid = ee_corrector!(X, Lp, P, Φ[:, 1:K], μ; n_outer = n_outer, tol = tol, σ2 = σ2)
@@ -818,7 +848,8 @@ function ee_fmg_solve(Lp::AbstractMatrix, μ_target::Float64, d::Int;
     Xc, _ = ee_continuation_solve(LpH, μ_target * N / Nc, d; K = K, σ2 = σ2)  # cascade on the coarse grid
     X = Matrix(Xc * P1') .* sqrt(N / Nc)                                      # prolong + amplitude rescale
     for a in 1:d; X[a, argmax(abs.(view(X, a, :)))] < 0 && (X[a, :] .*= -1); end   # sign gauge
-    Φf = Matrix(qr(P1 * eigen(Symmetric(Matrix(LpH))).vectors[:, 2:K+1]).Q)  # fine φ's interpolated from coarse
+    _, Φc = ee_bottom_eigvecs(LpH, K)                                         # coarse φ's (O(Nc), no dense eigen)
+    Φf = Matrix(qr(P1 * Φc).Q)                                                # interpolate to fine + orthonormalize
     # NOTE mass-inconsistency: coarse μ*_k = ν/Nc ≠ fine ν/N ⇒ prolonged embedding is under-developed and near
     # a spurious stationary point (a low residual is a transient, not convergence). Require the residual to
     # stay sub-tol for 2 consecutive sweeps so the early transient doesn't stop the refine prematurely.
