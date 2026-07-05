@@ -427,7 +427,8 @@ end
 # Two-level FAS cycle for genuine Elastic Embedding  (Phase-2 core; direct O(N²) Gaussian for now)
 # ----------------------------------------------------------------------------------------------
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
-       ee_two_level!, ee_two_level_P!, ee_diis, ee_solve, geometric_interpolation
+       ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, deflate_correct!,
+       ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -527,6 +528,37 @@ function geometric_interpolation(agg::AbstractVector{Int}, X::AbstractMatrix; c:
         end
     end
     sparse(Ip, Jp, Vp, n, nc), sparse(collect(1:nc), seed, ones(nc), nc, n)
+end
+
+"""
+    deflate_correct!(X, Lp, μ, Q; σ2) -> X
+
+Additive deflation of the near-null subspace of J = L⁺ − μL⁻(X). Q (N×k, orthonormal) spans the
+near-null / negative modes (in practice: the constant, X's own coordinate rows — which are J's null
+vectors since A(X*)=2X*J=0 — and a few relaxed test vectors). Re-solves the Q-space EXACTLY per
+coordinate, c = −(QᵀJQ)⁺ Qᵀ J x^a, x^a += Q c, so the Q-projected residual is zeroed. This overwrites
+any amplification the indefinite Galerkin coarse correction introduced on those modes, stabilizing the
+cycle WITHOUT removing the embedding (whose correct Q-value is what this restores). pinv handles the
+exact-null (constant) safely. O(N² k) from the dense J·Q (fast summation would make it O(N k)).
+"""
+function deflate_correct!(X, Lp, μ, Q; σ2 = 1.0)
+    Lm = build_Lminus_dense(X; σ2 = σ2)
+    QJQi = pinv(Matrix(Q' * (Lp * Q .- μ .* (Lm * Q))))          # (QᵀJQ)⁺  (k×k)
+    JXt = Lp * X' .- μ .* (Lm * X')                              # N×d : J x^a per column
+    X .-= permutedims(Q * (QJQi * (Q' * JXt)))                   # additive Q-space correction
+    X
+end
+
+"""One DEFLATED two-level FAS cycle: pre-smooth, aggregation coarse correction, additive deflation of
+the near-null modes Q (`deflate_correct!`), post-smooth. Q is the deflation basis (see deflate_correct!)."""
+function ee_two_level_deflated!(X, Lp, LpH, P, R, mass, μ, Q; ν1 = 1, ν2 = 2, σ2 = 1.0)
+    ee_smooth!(X, Lp, μ, ν1; σ2 = σ2)
+    Y0 = Matrix(X * R')
+    fH = ee_A(Y0, LpH, μ, mass; σ2 = σ2) .- Matrix(ee_A(X, Lp, μ, ones(size(X, 2)); σ2 = σ2) * P)
+    X .+= Matrix((ee_coarse_solve(Y0, LpH, μ, mass, fH; σ2 = σ2) .- Y0) * P')
+    deflate_correct!(X, Lp, μ, Q; σ2 = σ2)
+    ee_smooth!(X, Lp, μ, ν2; σ2 = σ2)
+    X
 end
 
 """Energy-minimizing iterate recombination (DIIS): X ← Σ c_k X_k, min‖Σ c_k A(X_k)‖ s.t. Σc_k=1.
