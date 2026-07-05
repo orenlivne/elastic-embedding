@@ -1,3 +1,8 @@
+> ⚠️ **STALE — superseded by `doc/formulation.md`.** This document describes an early
+> p-Laplacian-eigenproblem framing we pivoted away from. It does NOT reflect the current genuine
+> Elastic-Embedding formulation (dense Gaussian repulsion), the indefinite operator J = L⁺−μL⁻, or the
+> deflation finding. Read `doc/formulation.md` for the authoritative current picture. Kept for history.
+
 # Design: Nonlinear Spectral Embedding by Direct FAS Multigrid
 
 **Goal.** Compute a low-dimensional embedding of an irregular graph (kNN data graph, social,
