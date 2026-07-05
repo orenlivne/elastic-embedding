@@ -477,7 +477,8 @@ end
 # ----------------------------------------------------------------------------------------------
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
        ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, ee_two_level_galerkin!,
-       ee_chord_newton_step!, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
+       ee_chord_newton_step!, ee_defl_basis, ee_reduced_hessian, ee_reduced_newton_step!, ee_corrector!,
+       deflate_correct!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -652,6 +653,107 @@ function ee_chord_newton_step!(X, Lp, P, Q, μ; n_inner = 1, ν1 = 1, ν2 = 2, �
         X[a, :] .+= δ
     end
     X
+end
+
+"""
+    ee_defl_basis(Φ, X) -> Q  (N×k, orthonormal)
+
+Deflation / near-null basis for the developed-regime inner solver: Q = orthonormalize([1, Φ, X-rows]),
+where Φ (N×K) are L⁺'s bottom nontrivial eigenvectors (φ₂..φ_{K+1}). Since μL⁻ is a small perturbation,
+J's near-null cluster ≈ L⁺'s bottom modes; Stage 0 showed [1,X,TV] under-covers it in the developed regime
+(V⊥ factor → >1) while this basis holds ~0.15. Φ is sparse-Lanczos-cheap and the continuation needs it
+anyway (μ*_k = ν_{k+1}/N, φ_k pitchfork seeds).
+"""
+ee_defl_basis(Φ::AbstractMatrix, X::AbstractMatrix) =
+    Matrix(qr(hcat(ones(size(X, 2)), Φ, Matrix(X'))).Q)
+
+"""
+    ee_reduced_hessian(X, Lp, Q, μ; σ2) -> rH  (dk×dk, k=size(Q,2))
+
+Hessian of the EE energy restricted to the deflation subspace, in reduced coordinates C = X·Q (d×k), with
+the mass-derivative term the deflated inner solver drops. rH[(a,γ),(b,β)] (index (a,γ)→(γ−1)d+a):
+  attraction  2·δ_ab·(QᵀL⁺Q)[γ,β]
+  repulsion   −Σ_{i<j} W_ij[a,b]·ΔQ_γ·ΔQ_β,  W_ij = 2μ·exp(−‖rᵢⱼ‖²/σ²)(I−(2/σ²)rᵢⱼrᵢⱼᵀ),  ΔQ_γ=Q[i,γ]−Q[j,γ]
+Assembled directly (no dN×dN Hessian): O(N²·(dk)²) now, O(N·(dk)²) with fast summation. This is the design's
+Jred: the piece that lets the branch leave X=0 at finite amplitude (C=0 is a repellor above threshold).
+"""
+function ee_reduced_hessian(X::AbstractMatrix, Lp::AbstractMatrix, Q::AbstractMatrix, μ::Float64; σ2::Float64 = 1.0)
+    d, N = size(X); k = size(Q, 2); rH = zeros(d * k, d * k)
+    idx(a, γ) = (γ - 1) * d + a
+    QLQ = Matrix(Q' * (Lp * Q))
+    for γ in 1:k, β in 1:k, a in 1:d
+        rH[idx(a, γ), idx(a, β)] += 2 * QLQ[γ, β]
+    end
+    Id = Matrix(I, d, d)
+    for i in 1:N-1, j in i+1:N
+        r = @views X[:, i] .- X[:, j]; d2 = dot(r, r); s = exp(-d2 / σ2)
+        W = 2μ * s .* (Id .- (2 / σ2) .* (r * r'))
+        for γ in 1:k
+            dqγ = Q[i, γ] - Q[j, γ]; dqγ == 0 && continue
+            for β in 1:k
+                c = dqγ * (Q[i, β] - Q[j, β]); c == 0 && continue
+                for a in 1:d, b in 1:d
+                    rH[idx(a, γ), idx(b, β)] -= W[a, b] * c
+                end
+            end
+        end
+    end
+    rH
+end
+
+"""
+    ee_reduced_newton_step!(X, Lp, Q, μ; reg, σ2) -> X
+
+One Newton step on the deflation-subspace amplitudes C = X·Q (the modes the deflated inner solver leaves
+fixed). Solves rH·Δc = −(G·Q) with rH = `ee_reduced_hessian`, G = `ee_gradient`; writes ΔX = ΔC·Qᵀ.
+Quadratically convergent on the reduced system once in the basin; advances the embedding amplitudes so the
+continuation can drop the X*-pin.
+"""
+function ee_reduced_newton_step!(X::AbstractMatrix, Lp::AbstractMatrix, Q::AbstractMatrix, μ::Float64; reg::Float64 = 1e-9, σ2::Float64 = 1.0, linesearch::Bool = true)
+    d, N = size(X); k = size(Q, 2)
+    G = ee_gradient(X, Lp, μ)
+    rH = ee_reduced_hessian(X, Lp, Q, μ; σ2 = σ2)
+    # make the reduced Hessian positive so the step is a descent direction even away from the min
+    if linesearch
+        λmin = eigen(Symmetric(rH)).values[1]
+        rH[diagind(rH)] .+= max(reg, reg - λmin)
+    else
+        rH[diagind(rH)] .+= reg
+    end
+    GQ = Matrix(G * Q)                                       # d×k reduced gradient
+    rg = [GQ[a, γ] for γ in 1:k for a in 1:d]                # (γ−1)d+a order
+    ΔX = reshape(-(rH \ rg), d, k) * Q'
+    if linesearch
+        E0 = ee_energy(X, Lp, μ); gd = dot(ee_gradient(X, Lp, μ), ΔX); s = 1.0; bt = 0
+        while (En = ee_energy(X .+ s .* ΔX, Lp, μ); !isfinite(En) || En > E0 + 1e-4 * s * gd) && bt < 30
+            s *= 0.5; bt += 1
+        end
+        X .+= s .* ΔX
+    else
+        X .+= ΔX
+    end
+    X
+end
+
+"""
+    ee_corrector!(X, Lp, P, Φ, μ; n_outer, n_vperp, tol, σ2) -> (X, resid)
+
+Fixed-μ corrector = the deflation split. Each outer sweep: (i) `n_vperp` deflated inner cycles crush the
+V⊥ error at ~0.15/cycle (owns Q⊥), (ii) one reduced-V Newton step advances the embedding amplitudes (owns
+Q), with Q = `ee_defl_basis(Φ, X)` refreshed each sweep. Converges linear-then-quadratic (block-triangular
+iteration matrix, spectral radius max(≈0.15, ρ_Newton)). NO X*-pin — the amplitudes come from the equations.
+"""
+function ee_corrector!(X::AbstractMatrix, Lp::AbstractMatrix, P::AbstractMatrix, Φ::AbstractMatrix, μ::Float64;
+                       n_outer::Int = 12, n_vperp::Int = 1, tol::Float64 = 1e-8, σ2::Float64 = 1.0)
+    N = size(X, 2); resid = Inf
+    for _ in 1:n_outer
+        Q = ee_defl_basis(Φ, X)
+        for _ in 1:n_vperp; ee_chord_newton_step!(X, Lp, P, Q, μ; n_inner = 1, σ2 = σ2); end
+        ee_reduced_newton_step!(X, Lp, Q, μ; σ2 = σ2)
+        resid = norm(ee_A(X, Lp, μ, ones(N); σ2 = σ2))
+        resid < tol && break
+    end
+    X, resid
 end
 
 """One DEFLATED two-level FAS cycle: pre-smooth, aggregation coarse correction, additive deflation of
