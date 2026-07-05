@@ -203,7 +203,7 @@ end
 # ----------------------------------------------------------------------------------------------
 
 export knn_affinity_graph, gaussian_blobs, laplacian_eigenmaps,
-       ee_energy, ee_gradient, ee_minimize, ee_continuation, procrustes_rmsd, knn_purity
+       ee_energy, ee_gradient, ee_minimize, ee_continuation, ee_hessian, ee_newton, procrustes_rmsd, knn_purity
 
 """Gaussian blobs: `k` clusters of `nper` points in `dim`-dim space. Returns (data d×N, labels)."""
 function gaussian_blobs(nper::Int, k::Int, dim::Int; sep::Float64 = 6.0, rng::AbstractRNG = Random.default_rng())
@@ -290,6 +290,55 @@ function ee_continuation(Xseed::AbstractMatrix, Lp::AbstractMatrix, λs::Abstrac
     X = copy(Xseed)
     for λ in λs; X, _ = ee_minimize(X, Lp, λ; iters = iters); end
     X
+end
+
+"""
+    ee_hessian(X, Lp, λ; σ2) -> H  (dN×dN dense)
+
+Full EE Hessian at embedding X (d×N): H = 2 L⁺⊗I_d − L_W, where L_W is the block Laplacian of the d×d
+edge weights W_ij = 2λ·exp(−‖x_i−x_j‖²/σ²)·(I_d − (2/σ²) r_ij r_ijᵀ), r_ij = x_i−x_j. The `I` part is the
+chord term (2(L⁺−λL⁻)⊗I); the `−(2/σ²)rrᵀ` part is the mass-derivative (what the reduced-V corrector needs
+and what makes H indefinite away from the minimum). Index (a,i) → (i−1)d+a. Dense O(N²) build.
+"""
+function ee_hessian(X::AbstractMatrix, Lp::AbstractMatrix, λ::Float64; σ2::Float64 = 1.0)
+    d, N = size(X); H = zeros(d * N, d * N); Lpm = Matrix(Lp)
+    idx(a, i) = (i - 1) * d + a
+    for i in 1:N, a in 1:d, j in 1:N
+        Lpm[i, j] != 0 && (H[idx(a, i), idx(a, j)] += 2 * Lpm[i, j])
+    end
+    Id = Matrix(I, d, d)
+    for i in 1:N-1, j in i+1:N
+        r = X[:, i] .- X[:, j]; d2 = dot(r, r); s = exp(-d2 / σ2)
+        W = 2λ * s .* (Id .- (2 / σ2) .* (r * r'))
+        bi = (i - 1) * d; bj = (j - 1) * d
+        @views H[bi+1:bi+d, bj+1:bj+d] .+= W; @views H[bj+1:bj+d, bi+1:bi+d] .+= W
+        @views H[bi+1:bi+d, bi+1:bi+d] .-= W; @views H[bj+1:bj+d, bj+1:bj+d] .-= W
+    end
+    H
+end
+
+"""
+    ee_newton(X0, Lp, λ; iters, gtol, reg) -> (X, gradnorm)
+
+Damped full-Hessian Newton ground-truth solver for EE. Converges to a genuine stationary point (gradnorm
+→ 1e-12) at ANY μ, including near a bifurcation where `ee_minimize` (gradient descent) suffers critical
+slowing. Energy line search + tiny diagonal regularization (H is indefinite away from the min and has the
+translation null mode). Dense O((dN)³) — a reference solver, not the scalable one.
+"""
+function ee_newton(X0::AbstractMatrix, Lp::AbstractMatrix, λ::Float64; iters::Int = 60, gtol::Float64 = 1e-11, reg::Float64 = 1e-8, σ2::Float64 = 1.0)
+    d, N = size(X0); X = copy(X0); E = ee_energy(X, Lp, λ)
+    for _ in 1:iters
+        G = ee_gradient(X, Lp, λ); gn = norm(G); gn < gtol && break
+        H = ee_hessian(X, Lp, λ; σ2 = σ2); H[diagind(H)] .+= reg
+        Δ = reshape(-(H \ vec(G)), d, N)
+        s = 1.0; bt = 0; Xn = X .+ s .* Δ; En = ee_energy(Xn, Lp, λ)
+        while (!isfinite(En) || En > E - 1e-4 * s * dot(G, -Δ)) && bt < 40
+            s *= 0.5; Xn = X .+ s .* Δ; En = ee_energy(Xn, Lp, λ); bt += 1
+        end
+        bt ≥ 40 && (Xn = X .- 0.1 .* G ./ gn; En = ee_energy(Xn, Lp, λ))
+        X = Xn; E = En
+    end
+    X, norm(ee_gradient(X, Lp, λ))
 end
 
 """Procrustes-aligned normalized RMSD between two embeddings (d×N): rotation+reflection+scale invariant."""
