@@ -479,7 +479,7 @@ end
 export ee_A, ee_centroids, ee_restrict_sum, ee_interp, ee_smooth!, ee_coarse_solve,
        ee_two_level!, ee_two_level_P!, ee_two_level_deflated!, ee_two_level_galerkin!,
        ee_chord_newton_step!, ee_defl_basis, ee_reduced_hessian, ee_reduced_newton_step!, ee_corrector!,
-       ee_aggregate_P, ee_continuation_solve, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
+       ee_aggregate_P, ee_continuation_solve, ee_fmg_solve, deflate_correct!, ee_diis, ee_solve, geometric_interpolation
 
 """EE operator A(Y) = 2 Y Lstiff − 2μ Y L⁻(Y), repulsion weight mass_I·mass_J·exp(−‖·‖²/σ²)."""
 function ee_A(Y, Lstiff, μ, mass; σ2 = 1.0)
@@ -789,6 +789,40 @@ function ee_continuation_solve(Lp::AbstractMatrix, μ_target::Float64, d::Int;
     resid = Inf
     for μ in exp.(range(log(μ0), log(μ_target), length = nsteps))[2:end]
         _, resid = ee_corrector!(X, Lp, P, Φ[:, 1:K], μ; n_outer = n_outer, tol = tol, σ2 = σ2)
+    end
+    X, resid
+end
+
+"""
+    ee_fmg_solve(Lp, μ_target, d; K, n_refine, tol, σ2) -> (X, resid)
+
+FMG for EE: run the expensive μ-continuation cascade on a COARSE aggregation grid (small), then prolong the
+coarse embedding, rescale its amplitude to the fine scale (√(N/Nc)), and refine at μ_target on the fine grid
+with `ee_corrector!` — using fine deflation eigenvectors INTERPOLATED from the coarse ones (Pφ_coarse, no
+fine eigensolve). The fine grid does only refinement (a bounded number of sweeps), not the whole cascade.
+Validated to procrustes_rmsd ~3e-8 vs the Newton ground truth (swiss d=1). NOTE first cut: 2-level, dense
+coarse `eigen`/`pinv` (O(Nc³)) and a crude √(N/Nc) amplitude transfer; full O(N) needs recursive multilevel
+coarsening, a recursive inner-cycle coarse solve, and mass-weighted coarse repulsion.
+"""
+function ee_fmg_solve(Lp::AbstractMatrix, μ_target::Float64, d::Int;
+                      K::Int = 6, n_refine::Int = 20, tol::Float64 = 1e-7, σ2::Float64 = 1.0)
+    N = size(Lp, 1)
+    P1 = ee_aggregate_P(Lp); LpH = galerkin_coarse_operator(Lp, P1); Nc = size(LpH, 1)
+    Xc, _ = ee_continuation_solve(LpH, μ_target, d; K = K, σ2 = σ2)          # cascade on the coarse grid
+    X = Matrix(Xc * P1') .* sqrt(N / Nc)                                     # prolong + amplitude rescale
+    for a in 1:d; X[a, argmax(abs.(view(X, a, :)))] < 0 && (X[a, :] .*= -1); end   # sign gauge
+    Φf = Matrix(qr(P1 * eigen(Symmetric(Matrix(LpH))).vectors[:, 2:K+1]).Q)  # fine φ's interpolated from coarse
+    # NOTE mass-inconsistency: coarse μ*_k = ν/Nc ≠ fine ν/N ⇒ prolonged embedding is under-developed and near
+    # a spurious stationary point (a low residual is a transient, not convergence). Require the residual to
+    # stay sub-tol for 2 consecutive sweeps so the early transient doesn't stop the refine prematurely.
+    resid = Inf; below = 0
+    for _ in 1:n_refine
+        Q = ee_defl_basis(Φf, X)
+        ee_chord_newton_step!(X, Lp, P1, Q, μ_target; n_inner = 1, σ2 = σ2)
+        ee_reduced_newton_step!(X, Lp, Q, μ_target; σ2 = σ2)
+        resid = norm(ee_A(X, Lp, μ_target, ones(N); σ2 = σ2))
+        below = resid < tol ? below + 1 : 0
+        below ≥ 2 && break
     end
     X, resid
 end
